@@ -32,7 +32,7 @@ var (
 )
 
 var (
-	sharedReadBuf  = make([]byte, 4096)
+	sharedReadBuf  = make([]byte, 1024)
 	sharedWriteBuf = []byte("A")
 
 	tlsConfig = &tls.Config{
